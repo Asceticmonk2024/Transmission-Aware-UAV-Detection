@@ -1,0 +1,35 @@
+# 实验配置文件
+# 轻量级去雾+检测联合优化
+
+# 数据集配置
+dataset:
+  name: "HazyDet"
+  path: "data/raw/HazyDet"
+  train_split: "train"
+  val_split: "val" 
+  test_split: "test"
+  
+# 模型配置
+model:
+  backbone: "yolov8n"  # 轻量级骨干网络
+  input_size: [640, 640]
+  num_classes: 80  # 根据实际数据集调整
+  
+# 训练配置
+training:
+  batch_size: 16
+  epochs: 300
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  device: "cuda"
+  
+# 评估指标
+metrics:
+  detection: ["mAP@0.5", "mAP@0.5:0.95", "precision", "recall"]
+  dehazing: ["PSNR", "SSIM"]  # 如果有GT清晰图像
+  efficiency: ["FLOPs", "params", "inference_time"]
+  
+# Wandb配置
+wandb:
+  project: "dehaze-detect-joint"
+  entity: "your_username"  # 替换为你的wandb用户名
