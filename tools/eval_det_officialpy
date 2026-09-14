@@ -1,0 +1,111 @@
+# tools/eval_det_official.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import json
+
+import numpy as np
+from PIL import Image
+import torch
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from tqdm import tqdm
+
+from models.hfd_lite_det_official import HFDLiteDetOfficial
+
+
+def pil_to_tensor(img: Image.Image) -> torch.Tensor:
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=2)
+    x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    return x
+
+
+@torch.no_grad()
+def run_infer(model, pil_img: Image.Image, device, conf=0.25, iou=0.50):
+    W0, H0 = pil_img.size
+    tgt = pil_img.resize((512, 512), Image.BILINEAR)
+    x = pil_to_tensor(tgt).to(device)
+    dets512 = model(x, infer=True, conf=conf, iou=iou, max_det=300)  # [N,6] xyxy on 512 scale
+
+    if dets512 is None or dets512.numel() == 0:
+        return torch.zeros((0, 6))
+    # 映射回原图
+    dets = dets512.clone()
+    dets[:, [0, 2]] *= (W0 / 512.0)
+    dets[:, [1, 3]] *= (H0 / 512.0)
+    return dets
+
+
+def coco_eval(args):
+    ann = Path(args.data) / "val" / "val_coco.json" if args.split == "val" else Path(args.data) / args.split / "val_coco.json"
+    img_dir = Path(args.data) / "val" / "hazy_images" if args.split == "val" else Path(args.data) / args.split / "hazy_images"
+    print(f"Init: {img_dir.parent}\n  Annotation: {ann}\n  Images: {img_dir}")
+
+    coco = COCO(str(ann))
+    cats = {c["name"]: c["id"] for c in coco.loadCats(coco.getCatIds())}
+    print("  类别 id:", cats)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = HFDLiteDetOfficial(num_classes=3).to(device).eval()
+    if args.ckpt and Path(args.ckpt).is_file():
+        raw = torch.load(args.ckpt, map_location="cpu")
+        sd = raw.get("model", raw.get("state_dict", raw))
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"[model] loaded ckpt: {Path(args.ckpt).name}  (missing={len(missing)}, unexpected={len(unexpected)})")
+    else:
+        print("[model] fresh HFDLiteDetOfficial (no checkpoint).")
+
+    img_ids = coco.getImgIds()
+    if args.max_images and args.max_images > 0:
+        img_ids = img_ids[: args.max_images]
+
+    results = []
+    for img_id in tqdm(img_ids, desc="Infer"):
+        info = coco.loadImgs([img_id])[0]
+        p = img_dir / info["file_name"]
+        img = Image.open(p).convert("RGB")
+        det = run_infer(model, img, device, conf=args.conf, iou=args.iou)
+
+        if det is None or det.numel() == 0:
+            continue
+        d = det.cpu().numpy().tolist()
+        for x1, y1, x2, y2, sc, cl in d:
+            w = max(0.0, x2 - x1)
+            h = max(0.0, y2 - y1)
+            if w <= 1e-4 or h <= 1e-4:
+                continue
+            results.append({
+                "image_id": int(img_id),
+                "category_id": int(cl),
+                "bbox": [float(x1), float(y1), float(w), float(h)],
+                "score": float(sc),
+            })
+
+    out_json = Path(args.ckpt).with_suffix(".results.json") if args.ckpt else Path(args.out).with_suffix(".results.json")
+    with open(out_json, "w") as f:
+        json.dump(results, f)
+    print(f"Det JSON 写出: {out_json}")
+
+    coco_dt = coco.loadRes(str(out_json))
+    ev = COCOeval(coco, coco_dt, "bbox")
+    ev.evaluate(); ev.accumulate(); ev.summarize()
+
+
+def build_parser():
+    p = argparse.ArgumentParser("HazyDet COCO Eval (官方 YOLOv8 Head)")
+    p.add_argument("--data", type=str, default="data/HazyDet")
+    p.add_argument("--split", type=str, default="val")
+    p.add_argument("--ckpt", type=str, default="")
+    p.add_argument("--conf", type=float, default=0.25)
+    p.add_argument("--iou", type=float, default=0.50)
+    p.add_argument("--max-images", type=int, default=0)
+    p.add_argument("--out", type=str, default="runs/vis_official")
+    return p
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    coco_eval(args)
